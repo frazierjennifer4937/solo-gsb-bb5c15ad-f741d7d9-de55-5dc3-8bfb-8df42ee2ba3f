@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -183,6 +184,34 @@ def get_ledger(
     return scheduler.list_ledger(
         tenant_id=tenant_id, batch_id=batch_id, limit=limit
     )
+
+
+# ---------------------------------------------------------------------------
+# Usage reporting
+# ---------------------------------------------------------------------------
+
+@app.get("/usage/summary", tags=["usage"])
+def usage_summary(
+    start: datetime = Query(
+        ...,
+        description="Window start (inclusive), ISO-8601; naive values are "
+                    "treated as UTC.",
+        examples=["2026-09-23T00:00:00Z"],
+    ),
+    end: datetime = Query(
+        ...,
+        description="Window end (exclusive), ISO-8601; must be later than "
+                    "`start`, otherwise 400.",
+        examples=["2026-09-23T12:00:00Z"],
+    ),
+    tenant_id: str | None = Query(
+        None, description="Restrict the report to a single tenant."),
+):
+    """GPU usage rollup over the UTC window [start, end): per-tenant and
+    global GPU-minutes plus the number of overlapping jobs. Usage is measured
+    over each job's actual RUNNING interval (still-running jobs are truncated
+    at `end`); QUEUED jobs never count."""
+    return scheduler.usage_summary(start=start, end=end, tenant_id=tenant_id)
 
 
 @app.get("/health", tags=["system"])

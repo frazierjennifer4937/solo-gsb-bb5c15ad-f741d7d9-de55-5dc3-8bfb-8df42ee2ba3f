@@ -914,3 +914,96 @@ def list_ledger(
         return _list_ledger(
             db.get_conn(), tenant_id=tenant_id, batch_id=batch_id, limit=limit
         )
+
+
+# ---------------------------------------------------------------------------
+# Usage reporting
+# ---------------------------------------------------------------------------
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize to an aware UTC datetime; naive inputs are assumed UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def usage_summary(
+    start: datetime,
+    end: datetime,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate GPU-minutes and overlapping job counts over [start, end).
+
+    A job contributes only for the time it actually held GPUs:
+
+    * finished jobs (COMPLETED, or CANCELLED while running) use
+      ``[scheduled_at, completed_at)``;
+    * jobs still RUNNING use ``[scheduled_at, end)`` — truncated at the
+      query end;
+    * QUEUED jobs (never dispatched, ``scheduled_at`` is NULL) contribute
+      nothing.
+
+    The run interval is intersected with the query window as
+    left-closed/right-open, so a job merely touching a window boundary adds
+    zero and is not counted. Pure read: works on any existing database,
+    no schema change required.
+    """
+    start_utc = _as_utc(start)
+    end_utc = _as_utc(end)
+    if end_utc <= start_utc:
+        raise SchedulerError("end must be later than start")
+
+    with db.get_lock():
+        conn = db.get_conn()
+        sql = (
+            "SELECT id, tenant_id, gpus, status, scheduled_at, completed_at"
+            " FROM jobs WHERE status != ? AND scheduled_at IS NOT NULL"
+        )
+        params: list[Any] = [QUEUED]
+        if tenant_id is not None:
+            sql += " AND tenant_id = ?"
+            params.append(tenant_id)
+        rows = conn.execute(sql, params).fetchall()
+
+    per_tenant: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        run_start = _as_utc(_parse_iso(row["scheduled_at"]))
+        if row["completed_at"] is not None:
+            run_end = _as_utc(_parse_iso(row["completed_at"]))
+        else:
+            # Still running: truncated at the query end.
+            run_end = end_utc
+        lo = max(start_utc, run_start)
+        hi = min(end_utc, run_end)
+        if hi <= lo:
+            continue  # no overlap; touching a boundary does not count
+        minutes = (hi - lo).total_seconds() / 60.0
+        bucket = per_tenant.setdefault(
+            row["tenant_id"], {"gpu_minutes": 0.0, "job_count": 0}
+        )
+        bucket["gpu_minutes"] += row["gpus"] * minutes
+        bucket["job_count"] += 1
+
+    tenants = [
+        {
+            "tenant_id": tid,
+            "gpu_minutes": round(vals["gpu_minutes"], 6),
+            "job_count": vals["job_count"],
+        }
+        for tid, vals in sorted(per_tenant.items())
+    ]
+    if tenant_id is not None and not tenants:
+        # A filtered report keeps a stable shape: the tenant shows zeros.
+        tenants = [{"tenant_id": tenant_id, "gpu_minutes": 0.0, "job_count": 0}]
+    return {
+        "start": start_utc.isoformat(),
+        "end": end_utc.isoformat(),
+        "tenant_id": tenant_id,
+        "tenants": tenants,
+        "total": {
+            "gpu_minutes": round(
+                sum(v["gpu_minutes"] for v in per_tenant.values()), 6
+            ),
+            "job_count": sum(v["job_count"] for v in per_tenant.values()),
+        },
+    }

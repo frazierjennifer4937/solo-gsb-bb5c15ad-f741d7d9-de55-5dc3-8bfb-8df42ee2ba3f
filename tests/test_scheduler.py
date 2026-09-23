@@ -1,4 +1,6 @@
 """Core algorithm tests for WDRR + aging (service level, deterministic time)."""
+from datetime import datetime
+
 import pytest
 
 from app import db, scheduler
@@ -374,3 +376,104 @@ def test_queue_overview_annotates_blocked_by(conn):
     assert j["blocked_by"] == [{"id": "J000001", "status": "QUEUED"}]
     # The prerequisite job itself has no blockers.
     assert groups["a"]["jobs"][0]["blocked_by"] == []
+
+
+# ---------------------------------------------------------------------------
+# Usage summary (GPU usage rollup over a UTC time window)
+# ---------------------------------------------------------------------------
+
+def _set_completed(job_id, when):
+    db.get_conn().execute(
+        "UPDATE jobs SET completed_at = ? WHERE id = ?", (when, job_id))
+
+
+def test_usage_summary_running_intervals(conn):
+    submit("a", 2, 30, when=iso(0))
+    batch(10)                                # J000001 RUNNING since minute 10
+    submit("b", 4, 60, when=iso(15))
+    submit("c", 1, 10, when=iso(16))
+    batch(20)                                # J000002, J000003 RUNNING since 20
+    scheduler.complete_job("J000001")
+    _set_completed("J000001", iso(40))       # a ran [10, 40)
+    scheduler.cancel_job("J000003")          # cancelled while RUNNING
+    _set_completed("J000003", iso(30))       # c ran [20, 30)
+    # J000002 (b, 4 GPUs) is still RUNNING: truncated at the query end.
+
+    r = scheduler.usage_summary(at(0), at(50))
+    assert r["start"] == iso(0) and r["end"] == iso(50)
+    assert r["tenant_id"] is None
+    by_tenant = {t["tenant_id"]: t for t in r["tenants"]}
+    # a: 30 min x 2 GPUs; b: [20, 50) x 4; c: [20, 30) x 1.
+    assert by_tenant["a"]["gpu_minutes"] == pytest.approx(60.0)
+    assert by_tenant["a"]["job_count"] == 1
+    assert by_tenant["b"]["gpu_minutes"] == pytest.approx(120.0)
+    assert by_tenant["c"]["gpu_minutes"] == pytest.approx(10.0)
+    assert r["total"]["gpu_minutes"] == pytest.approx(190.0)
+    assert r["total"]["job_count"] == 3
+
+    # Left-closed/right-open: jobs starting exactly at `end` do not overlap.
+    r = scheduler.usage_summary(at(0), at(20))
+    assert r["total"]["gpu_minutes"] == pytest.approx(20.0)  # a: [10, 20) x 2
+    assert r["total"]["job_count"] == 1
+    # A job ending exactly at `start` does not overlap either.
+    r = scheduler.usage_summary(at(40), at(50))
+    assert [t["tenant_id"] for t in r["tenants"]] == ["b"]
+    assert r["total"]["gpu_minutes"] == pytest.approx(40.0)  # b: [40, 50) x 4
+
+
+def test_usage_summary_queued_jobs_never_count(conn):
+    submit("a", 8, 10, when=iso(0))
+    batch(10)                                # J000001 RUNNING, cluster full
+    submit("b", 1, 10, when=iso(11))         # stays QUEUED (no free GPUs)
+    submit("c", 1, 10, when=iso(12))
+    scheduler.cancel_job("J000003")          # cancelled while QUEUED
+
+    r = scheduler.usage_summary(at(0), at(30))
+    # Only J000001 ever held GPUs: [10, 30) x 8 = 160.
+    assert [t["tenant_id"] for t in r["tenants"]] == ["a"]
+    assert r["total"]["gpu_minutes"] == pytest.approx(160.0)
+    assert r["total"]["job_count"] == 1
+
+    # A window before anything ran is all zeros.
+    r = scheduler.usage_summary(at(0), at(5))
+    assert r["tenants"] == []
+    assert r["total"] == {"gpu_minutes": 0.0, "job_count": 0}
+
+
+def test_usage_summary_tenant_filter(conn):
+    submit("a", 2, 30, when=iso(0))
+    submit("b", 4, 30, when=iso(0))
+    batch(10)                                # both RUNNING since minute 10
+
+    r = scheduler.usage_summary(at(0), at(20), tenant_id="b")
+    assert r["tenant_id"] == "b"
+    assert len(r["tenants"]) == 1
+    assert r["tenants"][0]["tenant_id"] == "b"
+    assert r["tenants"][0]["gpu_minutes"] == pytest.approx(40.0)  # 10 min x 4
+    assert r["tenants"][0]["job_count"] == 1
+    assert r["total"]["gpu_minutes"] == pytest.approx(40.0)
+    assert r["total"]["job_count"] == 1
+
+    # Unknown tenant: stable zero-valued shape, not an error.
+    r = scheduler.usage_summary(at(0), at(20), tenant_id="nobody")
+    assert r["tenants"] == [
+        {"tenant_id": "nobody", "gpu_minutes": 0.0, "job_count": 0}]
+    assert r["total"] == {"gpu_minutes": 0.0, "job_count": 0}
+
+
+def test_usage_summary_rejects_inverted_window(conn):
+    with pytest.raises(scheduler.SchedulerError) as exc_info:
+        scheduler.usage_summary(at(10), at(10))
+    assert exc_info.value.status_code == 400
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.usage_summary(at(20), at(10))
+
+
+def test_usage_summary_naive_datetimes_are_utc(conn):
+    submit("a", 1, 30, when=iso(0))
+    batch(10)
+    r = scheduler.usage_summary(
+        datetime(2026, 1, 1), datetime(2026, 1, 1, 0, 20))
+    assert r["start"] == iso(0)
+    assert r["end"] == iso(20)
+    assert r["total"]["gpu_minutes"] == pytest.approx(10.0)  # [10, 20) x 1

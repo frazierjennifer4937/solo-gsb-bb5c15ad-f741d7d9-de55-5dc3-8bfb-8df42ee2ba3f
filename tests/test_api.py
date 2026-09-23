@@ -2,6 +2,8 @@
 
 import pytest
 
+from app import db
+
 
 def test_full_lifecycle_via_http(client):
     # Submit jobs for two tenants.
@@ -171,3 +173,69 @@ def test_cancelled_prerequisite_blocks_dependent_http(client):
     listed = client.get("/jobs?status=QUEUED&tenant_id=team-b").json()
     assert [j["id"] for j in listed] == [j2]
     assert listed[0]["blocked_by"] == [{"id": j1, "status": "CANCELLED"}]
+
+
+def test_usage_summary_endpoint(client):
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 6, "duration_min": 60}).json()["id"]
+    assert client.post("/scheduler/batch").json()["selection_order"] == [j1, j2]
+    # Cluster is full (8/8): this one stays QUEUED and must never count.
+    j3 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 1, "duration_min": 10}).json()["id"]
+    assert client.post("/scheduler/batch").json()["selection_order"] == []
+
+    client.post(f"/jobs/{j1}/complete")
+    # Pin the RUNNING intervals so the window math is deterministic:
+    # j1 ran [00:10, 00:40), j2 started 00:20 and is still RUNNING.
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ?, completed_at = ? WHERE id = ?",
+        ("2026-01-01T00:10:00+00:00", "2026-01-01T00:40:00+00:00", j1))
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ("2026-01-01T00:20:00+00:00", j2))
+
+    r = client.get("/usage/summary", params={
+        "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["tenant_id"] is None
+    by_tenant = {t["tenant_id"]: t for t in body["tenants"]}
+    # team-a: 30 min x 2 GPUs; team-b: [00:20, 01:00) x 6, truncated at end.
+    assert by_tenant["team-a"]["gpu_minutes"] == pytest.approx(60.0)
+    assert by_tenant["team-a"]["job_count"] == 1
+    assert by_tenant["team-b"]["gpu_minutes"] == pytest.approx(240.0)
+    assert by_tenant["team-b"]["job_count"] == 1
+    assert body["total"]["gpu_minutes"] == pytest.approx(300.0)
+    assert body["total"]["job_count"] == 2  # queued j3 never counts
+
+    # Optional tenant filter.
+    body = client.get("/usage/summary", params={
+        "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z",
+        "tenant_id": "team-a"}).json()
+    assert [t["tenant_id"] for t in body["tenants"]] == ["team-a"]
+    assert body["total"]["gpu_minutes"] == pytest.approx(60.0)
+
+    # A window without overlapping jobs reports zeros.
+    body = client.get("/usage/summary", params={
+        "start": "2025-12-31T00:00:00Z",
+        "end": "2026-01-01T00:05:00Z"}).json()
+    assert body["tenants"] == []
+    assert body["total"] == {"gpu_minutes": 0.0, "job_count": 0}
+
+
+def test_usage_summary_window_validation(client):
+    # end not later than start -> 400.
+    for params in (
+        {"start": "2026-01-01T01:00:00Z", "end": "2026-01-01T01:00:00Z"},
+        {"start": "2026-01-02T00:00:00Z", "end": "2026-01-01T00:00:00Z"},
+    ):
+        r = client.get("/usage/summary", params=params)
+        assert r.status_code == 400
+        assert "error" in r.json()
+    # Malformed timestamps are rejected by request validation.
+    r = client.get("/usage/summary", params={
+        "start": "soon", "end": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 422

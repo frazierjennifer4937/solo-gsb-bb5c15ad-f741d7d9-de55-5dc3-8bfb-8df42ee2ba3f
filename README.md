@@ -6,16 +6,21 @@
 - **存储**：SQLite（WAL 模式，零外部依赖，数据持久化到挂载卷）
 - **可复现**：固定租户访问顺序（租户 id 升序）、租户内 FIFO、顺序作业 id、无随机数；相同输入必然得到相同选择顺序
 - **可审计**：每笔 `AGING / QUANTUM / DISPATCH` 余额变动都写入 `ledger`
+- **用量汇总**：`GET /usage/summary` 按 UTC 时间窗统计各租户与全局的 GPU-分钟数与重叠作业数（纯只读，兼容既有 SQLite 数据库，无需迁移）
 
 ---
 
 ## 一条命令启动
 
 ```bash
-docker compose up --build -d
+docker compose up --build -d   # 构建镜像并后台启动
+docker compose ps              # 查看状态（healthcheck 通过后为 healthy）
+docker compose logs -f         # 跟踪服务日志
 ```
 
 服务监听 **`http://localhost:8000`**（容器内 8000，可在 `docker-compose.yml` 改宿主机端口）。
+数据持久化在命名卷 `scheduler-data`（容器内 `/data/scheduler.db`），重启、重新构建均不丢失；
+既有数据库无需任何迁移即可直接使用包括 `GET /usage/summary` 在内的全部接口。
 
 停止 / 清理：
 
@@ -220,6 +225,47 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 }
 ```
 
+### 5. 按时间窗汇总 GPU 用量 `GET /usage/summary`
+
+按 UTC 时间窗 `[start, end)`（**左闭右开**）汇总 GPU 用量，返回**各租户**与**全局**的
+GPU-分钟数与重叠作业数。只读接口，直接查询既有 SQLite 表，不需要数据迁移。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `start` | 是 | 窗口起点（含），ISO-8601；不带时区时按 UTC 处理 |
+| `end` | 是 | 窗口终点（不含）；不晚于 `start` 时返回 `400` |
+| `tenant_id` | 否 | 只统计该租户；省略时覆盖全部租户 |
+
+用量按作业**实际 RUNNING 区间**计算：
+
+- 已结束作业（`COMPLETED`，或运行中被 `CANCELLED`）：`[scheduled_at, completed_at)`；
+- 仍在运行的作业：`[scheduled_at, end)`——**截断到查询截止时刻**；
+- `QUEUED` 作业（含排队中被取消的）从未占用 GPU，不计入；
+- 与查询区间按左闭右开求交：仅与边界相接（如 `completed_at == start` 或
+  `scheduled_at == end`）的作业不算重叠，贡献为零。
+
+```bash
+curl "http://localhost:8000/usage/summary?start=2026-09-23T00:00:00Z&end=2026-09-23T12:00:00Z"
+# 可选租户筛选
+curl "http://localhost:8000/usage/summary?start=2026-09-23T00:00:00Z&end=2026-09-23T12:00:00Z&tenant_id=team-a"
+```
+
+```jsonc
+{
+  "start": "2026-09-23T00:00:00+00:00",
+  "end": "2026-09-23T12:00:00+00:00",
+  "tenant_id": null,
+  "tenants": [
+    {"tenant_id": "team-a", "gpu_minutes": 60.0,  "job_count": 1},
+    {"tenant_id": "team-b", "gpu_minutes": 240.0, "job_count": 1}
+  ],
+  "total": {"gpu_minutes": 300.0, "job_count": 2}
+}
+```
+
+窗口内无重叠作业时数值为零：未筛选时 `tenants` 为空数组；指定 `tenant_id` 时返回
+该租户的零值条目（租户不存在时同样返回零值，不报错）。
+
 ### 端点一览
 
 | 方法 | 路径 | 说明 |
@@ -235,6 +281,7 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
 | GET | `/ledger` | 信用/扣减审计流水 |
+| GET | `/usage/summary` | 按 UTC 时间窗汇总 GPU 用量（GPU-分钟 + 重叠作业数，可选 `tenant_id`） |
 | GET | `/health` | 健康检查 |
 
 ---
@@ -275,7 +322,7 @@ curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（23 个：服务层算法/依赖 + HTTP 端到端）
+# 运行全部测试（30 个：服务层算法/依赖/用量汇总 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
