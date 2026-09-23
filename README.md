@@ -11,8 +11,14 @@
 
 ## 一条命令启动
 
+需要本机已安装 Docker 与 Docker Compose 插件（Docker Desktop / `docker-compose-plugin`）。
+镜像构建只需 `requirements.txt`，SQLite 数据库文件保存在命名卷 `scheduler-data`
+（容器内 `/data/scheduler.db`），重建容器不丢数据：
+
 ```bash
-docker compose up --build -d
+docker compose up --build -d        # 构建镜像并后台启动
+docker compose logs -f scheduler    # 跟踪服务日志（Ctrl-C 仅退出查看）
+docker compose ps                   # 查看容器与健康检查状态
 ```
 
 服务监听 **`http://localhost:8000`**（容器内 8000，可在 `docker-compose.yml` 改宿主机端口）。
@@ -220,6 +226,49 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 }
 ```
 
+### 5. 按时间窗汇总 GPU 用量 `GET /usage/gpu`
+
+按 UTC 时间窗 `[start, end)`（**左闭右开**）汇总每租户与全局的实际 GPU 用量：
+
+- 用量来自作业的**实际 RUNNING 区间**，而非提交时的 `duration_min` 估算：
+  - **已结束作业**（`COMPLETED`，或运行中被 `CANCELLED`）：`scheduled_at → completed_at`；
+  - **仍在运行的作业**：`scheduled_at` 起算，**截断到查询截止时刻 `end`**（不假设作业在未来仍持续）。
+- 与查询区间按左闭右开求交：作业恰好在 `end` 才启动、或恰好在 `start` 结束，用量均为 **0**。
+- **QUEUED 作业不计入**（从未占用 GPU）；排队期间被取消的作业同样不计。
+- 用量 = `gpus × 交集分钟数`；`overlapping_jobs` 为 RUNNING 区间与时间窗有非空交集的作业数（不是 GPU 数）。
+- 返回所有已知租户（按 id 排序），**无重叠作业的租户数值为零**；时间窗内无任何作业时，全局用量也为零。
+- 查询参数：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `start` | 是 | 起始时刻（**UTC**，ISO-8601，如 `2026-09-23T00:00:00Z`），含 |
+| `end` | 是 | 截止时刻（**UTC**，ISO-8601），不含；**必须晚于 `start`，否则 400** |
+| `tenant_id` | 否 | 只统计单个租户（未知租户返回 404）；缺省统计全部租户 |
+
+```bash
+curl -G "http://localhost:8000/usage/gpu" \
+  --data-urlencode "start=2026-09-23T00:00:00Z" \
+  --data-urlencode "end=2026-09-23T01:00:00Z"
+# 只看某租户：
+curl -G "http://localhost:8000/usage/gpu" \
+  --data-urlencode "start=2026-09-23T00:00:00Z" \
+  --data-urlencode "end=2026-09-23T01:00:00Z" \
+  --data-urlencode "tenant_id=team-a"
+```
+
+```jsonc
+{
+  "start": "2026-09-23T00:00:00+00:00",
+  "end": "2026-09-23T01:00:00+00:00",
+  "tenant_id": null,
+  "global": { "gpu_minutes": 180.0, "overlapping_jobs": 2 },
+  "tenants": [
+    {"tenant_id": "team-a", "gpu_minutes": 60.0,  "overlapping_jobs": 1},
+    {"tenant_id": "team-b", "gpu_minutes": 120.0, "overlapping_jobs": 1}
+  ]
+}
+```
+
 ### 端点一览
 
 | 方法 | 路径 | 说明 |
@@ -234,6 +283,7 @@ curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/
 | POST | `/scheduler/batch` | **调度下一批**，返回选择顺序与余额 |
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
+| GET | `/usage/gpu` | **按 UTC 时间窗汇总**每租户/全局 GPU-分钟与重叠作业数（可选 `tenant_id`） |
 | GET | `/ledger` | 信用/扣减审计流水 |
 | GET | `/health` | 健康检查 |
 
@@ -265,6 +315,13 @@ curl -s -X POST localhost:8000/scheduler/batch        # => []（J000003 仍 RUNN
 curl -s localhost:8000/jobs/J000004                   # blocked_by 标明 J000003/RUNNING
 curl -s -X POST localhost:8000/jobs/J000003/complete
 curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
+
+# 按 UTC 时间窗汇总实际 GPU 用量（已结束作业取 scheduled_at→completed_at，
+# 仍 RUNNING 的作业截断到 end；QUEUED 不计；左闭右开）
+curl -s -G localhost:8000/usage/gpu \
+  --data-urlencode "start=2026-09-23T00:00:00Z" \
+  --data-urlencode "end=2026-09-23T02:00:00Z"
+# {"global":{"gpu_minutes":...,"overlapping_jobs":...},"tenants":[...]}
 ```
 
 ---
@@ -275,7 +332,7 @@ curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（23 个：服务层算法/依赖 + HTTP 端到端）
+# 运行全部测试（37 个：服务层算法/依赖/用量汇总 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）

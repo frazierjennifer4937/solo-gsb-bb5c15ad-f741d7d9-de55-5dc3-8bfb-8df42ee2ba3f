@@ -374,3 +374,177 @@ def test_queue_overview_annotates_blocked_by(conn):
     assert j["blocked_by"] == [{"id": "J000001", "status": "QUEUED"}]
     # The prerequisite job itself has no blockers.
     assert groups["a"]["jobs"][0]["blocked_by"] == []
+
+
+# ---------------------------------------------------------------------------
+# GPU usage window aggregation
+# ---------------------------------------------------------------------------
+
+def dispatch(tenant, gpus, minutes, weight=1.0, when=0):
+    """Submit and batch-dispatch a job, then return it (RUNNING)."""
+    job = submit(tenant, gpus, minutes, weight=weight, when=iso(when))
+    scheduler.run_batch(now=at(when))
+    return scheduler.get_job(job["id"])
+
+
+def set_interval(job_id, start_min, end_min=None, status=None):
+    """Pin a job's actual RUNNING interval (end_min=None => still RUNNING)."""
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        (iso(start_min), job_id),
+    )
+    if end_min is None:
+        conn.execute(
+            "UPDATE jobs SET status = 'RUNNING', completed_at = NULL WHERE id = ?",
+            (job_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
+            (status or "COMPLETED", iso(end_min), job_id),
+        )
+
+
+def usage_tenants(start_min, end_min, tenant_id=None):
+    r = scheduler.gpu_usage(at(start_min), at(end_min), tenant_id=tenant_id)
+    return r, {t["tenant_id"]: t for t in r["tenants"]}
+
+
+def test_gpu_usage_finished_jobs_intersected_with_window(conn):
+    j1 = dispatch("a", 2, 30)                       # will pin [10, 40)
+    j2 = dispatch("b", 4, 60)                       # will pin [30, 90)
+    set_interval(j1["id"], 10, 40)
+    set_interval(j2["id"], 30, 90)
+
+    r, tenants = usage_tenants(0, 60)
+    assert r["start"].endswith("+00:00")
+    # a: 2 GPU x 30 min fully inside = 60; b: 4 GPU x 30 min clipped = 120.
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0)
+    assert tenants["a"]["overlapping_jobs"] == 1
+    assert tenants["b"]["gpu_minutes"] == pytest.approx(120.0)
+    assert tenants["b"]["overlapping_jobs"] == 1
+    assert r["global"]["gpu_minutes"] == pytest.approx(180.0)
+    assert r["global"]["overlapping_jobs"] == 2
+
+
+def test_gpu_usage_clips_on_both_sides(conn):
+    j = dispatch("a", 2, 100)
+    set_interval(j["id"], 10, 110)
+    _, tenants = usage_tenants(20, 60)
+    # 2 GPU x 40 min.
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(80.0)
+    assert tenants["a"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_half_open_boundaries(conn):
+    j = dispatch("a", 2, 10)
+    set_interval(j["id"], 10, 20)
+
+    # Window ends exactly when the run starts: no overlap (right-open).
+    r, tenants = usage_tenants(0, 10)
+    assert tenants["a"]["gpu_minutes"] == 0.0
+    assert tenants["a"]["overlapping_jobs"] == 0
+    assert r["global"]["overlapping_jobs"] == 0
+
+    # Window starts exactly when the run ends: no overlap (left-closed window,
+    # run interval also half-open).
+    _, tenants = usage_tenants(20, 30)
+    assert tenants["a"]["gpu_minutes"] == 0.0
+    assert tenants["a"]["overlapping_jobs"] == 0
+
+    # [run_start, run_end) covers the run in full.
+    _, tenants = usage_tenants(10, 20)
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(20.0)
+    assert tenants["a"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_still_running_truncated_at_cutoff(conn):
+    j = dispatch("a", 3, 10)
+    set_interval(j["id"], 10, None)                 # RUNNING since t=10
+
+    r, tenants = usage_tenants(0, 50)
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(120.0)  # 3 x 40
+    assert tenants["a"]["overlapping_jobs"] == 1
+
+    # Cutoff before the run started: nothing.
+    _, tenants = usage_tenants(0, 10)
+    assert tenants["a"]["gpu_minutes"] == 0.0
+    assert tenants["a"]["overlapping_jobs"] == 0
+
+    # Window entirely after the start: run assumed ongoing until the cutoff.
+    _, tenants = usage_tenants(60, 80)
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(60.0)  # 3 x 20
+
+
+def test_gpu_usage_excludes_queued_jobs(conn):
+    run = dispatch("b", 1, 20)
+    set_interval(run["id"], 0, 20)
+    # Submitted after the batch, never dispatched: stays QUEUED.
+    submit("a", 2, 30, when=iso(0))
+
+    r, tenants = usage_tenants(0, 60)
+    assert tenants["a"]["gpu_minutes"] == 0.0
+    assert tenants["a"]["overlapping_jobs"] == 0
+    assert tenants["b"]["gpu_minutes"] == pytest.approx(20.0)
+    assert r["global"]["gpu_minutes"] == pytest.approx(20.0)
+    assert r["global"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_counts_cancelled_running_not_cancelled_queued(conn):
+    ran = dispatch("a", 2, 10)
+    set_interval(ran["id"], 10, 25, status="CANCELLED")  # ran then cancelled
+    queued = submit("a", 1, 5, when=iso(0))
+    scheduler.cancel_job(queued["id"])               # never ran
+
+    _, tenants = usage_tenants(0, 60)
+    # Cancelled while RUNNING: actual interval [10, 25) counts.
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(30.0)  # 2 x 15
+    assert tenants["a"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_lists_tenants_without_overlap_as_zero(conn):
+    j = dispatch("a", 2, 10)
+    set_interval(j["id"], 0, 10)
+    scheduler.upsert_tenant("c", 1.0)
+
+    r, tenants = usage_tenants(0, 60)
+    assert set(tenants) == {"a", "c"}
+    assert tenants["c"] == {
+        "tenant_id": "c", "gpu_minutes": 0.0, "overlapping_jobs": 0}
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(20.0)
+
+
+def test_gpu_usage_tenant_filter(conn):
+    ja = dispatch("a", 2, 10)
+    jb = dispatch("b", 4, 10)
+    set_interval(ja["id"], 0, 10)
+    set_interval(jb["id"], 0, 10)
+
+    r, tenants = usage_tenants(0, 60, tenant_id="a")
+    assert set(tenants) == {"a"}
+    assert tenants["a"]["gpu_minutes"] == pytest.approx(20.0)
+    # Global aggregates the filtered scope only.
+    assert r["global"]["gpu_minutes"] == pytest.approx(20.0)
+    assert r["tenant_id"] == "a"
+
+    with pytest.raises(scheduler.NotFound):
+        scheduler.gpu_usage(at(0), at(60), tenant_id="ghost")
+
+
+def test_gpu_usage_rejects_window_ending_not_after_start(conn):
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.gpu_usage(at(30), at(30))
+    with pytest.raises(scheduler.SchedulerError):
+        scheduler.gpu_usage(at(30), at(10))
+
+
+def test_gpu_usage_naive_datetimes_treated_as_utc(conn):
+    from datetime import datetime
+
+    j = dispatch("a", 2, 10)
+    set_interval(j["id"], 10, 40)
+    naive = scheduler.gpu_usage(
+        datetime(2026, 1, 1, 0, 10), datetime(2026, 1, 1, 1, 0))
+    aware, _ = usage_tenants(10, 60)
+    assert naive["global"] == aware["global"]

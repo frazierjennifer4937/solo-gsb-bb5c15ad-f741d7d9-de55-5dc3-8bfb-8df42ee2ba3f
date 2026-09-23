@@ -171,3 +171,112 @@ def test_cancelled_prerequisite_blocks_dependent_http(client):
     listed = client.get("/jobs?status=QUEUED&tenant_id=team-b").json()
     assert [j["id"] for j in listed] == [j2]
     assert listed[0]["blocked_by"] == [{"id": j1, "status": "CANCELLED"}]
+
+
+def test_gpu_usage_window_via_http(client):
+    from app import db
+
+    # Dispatch two jobs (2 GPU team-a, 4 GPU team-b), then pin their real
+    # RUNNING intervals so assertions are exact.
+    j1 = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    j2 = client.post("/jobs", json={
+        "tenant_id": "team-b", "gpus": 4, "duration_min": 60}).json()["id"]
+    client.post("/scheduler/batch")
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ("2026-01-01T00:10:00+00:00", j1))
+    conn.execute(
+        "UPDATE jobs SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+        ("2026-01-01T00:40:00+00:00", j1))
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ("2026-01-01T00:30:00+00:00", j2))
+
+    # j1 fully inside [00:00,01:00): 2 x 30 = 60; j2 still RUNNING, truncated
+    # at 01:00: 4 x 30 = 120.
+    r = client.get(
+        "/usage/gpu",
+        params={"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["start"] == "2026-01-01T00:00:00+00:00"
+    assert body["end"] == "2026-01-01T01:00:00+00:00"
+    assert body["tenant_id"] is None
+    tenants = {t["tenant_id"]: t for t in body["tenants"]}
+    assert tenants["team-a"] == {
+        "tenant_id": "team-a", "gpu_minutes": 60.0, "overlapping_jobs": 1}
+    assert tenants["team-b"]["gpu_minutes"] == 120.0
+    assert tenants["team-b"]["overlapping_jobs"] == 1
+    assert body["global"] == {"gpu_minutes": 180.0, "overlapping_jobs": 2}
+
+    # Right-open boundary: window ending exactly when j2 starts excludes it.
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T00:30:00Z"})
+    body = r.json()
+    tenants = {t["tenant_id"]: t for t in body["tenants"]}
+    assert tenants["team-a"]["gpu_minutes"] == 40.0  # 2 x 20
+    assert tenants["team-b"]["gpu_minutes"] == 0.0
+    assert tenants["team-b"]["overlapping_jobs"] == 0
+    assert body["global"]["overlapping_jobs"] == 1
+
+
+def test_gpu_usage_tenant_filter_via_http(client):
+    from app import db
+
+    j = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 2, "duration_min": 30}).json()["id"]
+    client.post("/scheduler/batch")
+    conn = db.get_conn()
+    conn.execute(
+        "UPDATE jobs SET scheduled_at = ? WHERE id = ?",
+        ("2026-01-01T00:10:00+00:00", j))
+
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T01:00:00Z",
+        "tenant_id": "team-a"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [t["tenant_id"] for t in body["tenants"]] == ["team-a"]
+    assert body["global"]["gpu_minutes"] == 100.0  # 2 x 50 (still RUNNING)
+
+    # Unknown tenant -> 404.
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T01:00:00Z",
+        "tenant_id": "ghost"})
+    assert r.status_code == 404
+
+
+def test_gpu_usage_invalid_window_via_http(client):
+    # end <= start -> 400.
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T01:00:00Z",
+        "end": "2026-01-01T01:00:00Z"})
+    assert r.status_code == 400
+    assert "end must be later" in r.json()["detail"]
+
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T02:00:00Z",
+        "end": "2026-01-01T01:00:00Z"})
+    assert r.status_code == 400
+
+    # Missing / malformed params -> 422.
+    assert client.get("/usage/gpu", params={
+        "start": "2026-01-01T00:00:00Z"}).status_code == 422
+    assert client.get("/usage/gpu", params={
+        "start": "not-a-time", "end": "2026-01-01T01:00:00Z"
+        }).status_code == 422
+
+
+def test_gpu_usage_empty_database_zeros(client):
+    r = client.get("/usage/gpu", params={
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T01:00:00Z"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tenants"] == []
+    assert body["global"] == {"gpu_minutes": 0.0, "overlapping_jobs": 0}

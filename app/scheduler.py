@@ -90,6 +90,14 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Normalise a datetime to timezone-aware UTC; naive inputs are treated
+    as UTC (ISO-8601 timestamps without an offset are conventionally UTC)."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _job_id(conn: sqlite3.Connection) -> str:
     # Deterministic, human-readable sequential ids (J000001, ...).
     row = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
@@ -796,6 +804,111 @@ def list_jobs(
     with db.get_lock():
         conn = db.get_conn()
         return [_job_dict(conn, r) for r in conn.execute(sql, params)]
+
+
+def gpu_usage(
+    start: datetime,
+    end: datetime,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate GPU usage over a half-open ``[start, end)`` UTC window.
+
+    Usage is computed from each job's *actual RUNNING interval*:
+
+    * finished jobs (COMPLETED/CANCELLED while RUNNING): ``scheduled_at`` to
+      ``completed_at``;
+    * still-RUNNING jobs: ``scheduled_at`` truncated to the query cutoff.
+
+    QUEUED jobs have never run and never contribute. Intervals intersect the
+    query window left-closed/right-open, so a job starting exactly at ``end``
+    or ending exactly at ``start`` contributes nothing.
+
+    Returns per-tenant and global GPU-minutes (``gpus`` times the intersected
+    duration in minutes) plus the number of overlapping RUNNING intervals.
+    Every known tenant (or just ``tenant_id`` when filtered) appears, with
+    zero values when none of its jobs overlaps the window.
+    """
+    start = _as_utc(start)
+    end = _as_utc(end)
+    if end <= start:
+        raise SchedulerError("end must be later than start (UTC)")
+
+    with db.get_lock():
+        conn = db.get_conn()
+        if tenant_id is not None:
+            if conn.execute(
+                "SELECT 1 FROM tenants WHERE id = ?", (tenant_id,)
+            ).fetchone() is None:
+                raise NotFound(f"tenant '{tenant_id}' not found")
+            tenant_rows = conn.execute(
+                "SELECT id FROM tenants WHERE id = ? ORDER BY id",
+                (tenant_id,),
+            ).fetchall()
+        else:
+            tenant_rows = conn.execute(
+                "SELECT id FROM tenants ORDER BY id"
+            ).fetchall()
+
+        per_tenant: dict[str, dict[str, Any]] = {
+            r["id"]: {"tenant_id": r["id"], "gpu_minutes": 0.0,
+                      "overlapping_jobs": 0}
+            for r in tenant_rows
+        }
+
+        # Only jobs that actually entered RUNNING state: their RUNNING interval
+        # is [scheduled_at, completed_at), truncated to the query cutoff.
+        rows = conn.execute(
+            """SELECT id, tenant_id, gpus, status,
+                      scheduled_at, completed_at
+                 FROM jobs
+                WHERE scheduled_at IS NOT NULL
+                  AND (? IS NULL OR tenant_id = ?)
+                ORDER BY id""",
+            (tenant_id, tenant_id),
+        ).fetchall()
+
+        total_minutes = 0.0
+        total_overlaps = 0
+        for r in rows:
+            ran_start = _parse_iso(r["scheduled_at"])
+            if r["completed_at"] is not None:
+                ran_end = _parse_iso(r["completed_at"])
+            else:
+                # Still RUNNING: the run is assumed to extend to the query
+                # cutoff, never beyond it.
+                ran_end = end
+
+            lo = max(ran_start, start)
+            hi = min(ran_end, end)
+            if hi <= lo:
+                continue  # empty half-open intersection -> not overlapping
+
+            minutes = (hi - lo).total_seconds() / 60.0
+            gpu_minutes = r["gpus"] * minutes
+            entry = per_tenant[r["tenant_id"]]
+            entry["gpu_minutes"] += gpu_minutes
+            entry["overlapping_jobs"] += 1
+            total_minutes += gpu_minutes
+            total_overlaps += 1
+
+        tenants = [
+            {
+                "tenant_id": t,
+                "gpu_minutes": round(v["gpu_minutes"], 6),
+                "overlapping_jobs": v["overlapping_jobs"],
+            }
+            for t, v in per_tenant.items()
+        ]
+        return {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "tenant_id": tenant_id,
+            "global": {
+                "gpu_minutes": round(total_minutes, 6),
+                "overlapping_jobs": total_overlaps,
+            },
+            "tenants": tenants,
+        }
 
 
 def queue_overview() -> dict[str, Any]:

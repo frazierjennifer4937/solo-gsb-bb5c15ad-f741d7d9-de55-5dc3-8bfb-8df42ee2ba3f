@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -183,6 +184,27 @@ def get_ledger(
     return scheduler.list_ledger(
         tenant_id=tenant_id, batch_id=batch_id, limit=limit
     )
+
+
+@app.get("/usage/gpu", tags=["usage"])
+def get_gpu_usage(
+    start: datetime = Query(
+        ..., description="Window start (UTC, ISO-8601), inclusive."),
+    end: datetime = Query(
+        ..., description="Window end (UTC, ISO-8601), exclusive."),
+    tenant_id: str | None = Query(
+        None, description="Optional tenant filter; defaults to all tenants."),
+):
+    """Per-tenant and global GPU-minutes over a [start, end) UTC window.
+
+    Usage derives from actual RUNNING intervals: finished jobs use
+    scheduled_at -> completed_at, still-RUNNING jobs are truncated to ``end``.
+    QUEUED jobs never count. Returns 400 when end is not later than start.
+    """
+    try:
+        return scheduler.gpu_usage(start=start, end=end, tenant_id=tenant_id)
+    except SchedulerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
 @app.get("/health", tags=["system"])
